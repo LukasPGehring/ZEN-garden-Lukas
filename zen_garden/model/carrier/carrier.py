@@ -39,6 +39,10 @@ class Carrier(Element):
         # raw import
         self.raw_time_series = {}
         self.raw_time_series["demand"] = self.data_input.extract_input_data("demand", index_sets=["set_nodes", "set_time_steps"], time_steps="set_base_time_steps_yearly", unit_category={"energy_quantity": 1, "time": -1})
+        self.raw_time_series["gamma_max"] = self.data_input.extract_input_data("gamma_max",
+                                                                            index_sets=["set_nodes", "set_time_steps"],
+                                                                            time_steps="set_base_time_steps_yearly",
+                                                                            unit_category={})
         self.raw_time_series["availability_import"] = self.data_input.extract_input_data("availability_import", index_sets=["set_nodes", "set_time_steps"], time_steps="set_base_time_steps_yearly", unit_category={"energy_quantity": 1, "time": -1})
         self.raw_time_series["availability_export"] = self.data_input.extract_input_data("availability_export", index_sets=["set_nodes", "set_time_steps"], time_steps="set_base_time_steps_yearly", unit_category={"energy_quantity": 1, "time": -1})
         self.raw_time_series["price_export"] = self.data_input.extract_input_data("price_export", index_sets=["set_nodes", "set_time_steps"], time_steps="set_base_time_steps_yearly", unit_category={"money": 1, "energy_quantity": -1})
@@ -50,6 +54,9 @@ class Carrier(Element):
         self.carbon_intensity_carrier_export = self.data_input.extract_input_data("carbon_intensity_carrier_export", index_sets=["set_nodes", "set_time_steps_yearly"], time_steps="set_time_steps_yearly",  unit_category={"emissions": 1, "energy_quantity": -1})
         self.price_shed_demand = self.data_input.extract_input_data("price_shed_demand", index_sets=[], unit_category={"money": 1, "energy_quantity": -1})
         self.conversion_output_capacity = self.data_input.extract_input_data("conversion_output_capacity", index_sets=["set_nodes", "set_time_steps_yearly"], time_steps="set_time_steps_yearly", unit_category={"energy_quantity": 1, "time": -1})
+        self.price_shifted_demand = self.data_input.extract_input_data("price_shifted_demand", index_sets=[], unit_category={"money": 1, "energy_quantity": -1})
+        self.flexibility_window_size = self.data_input.extract_input_data("flexibility_window_size",index_sets=[], unit_category={})
+        self.delay = self.data_input.extract_input_data("delay", index_sets=[], unit_category={})
 
     def overwrite_time_steps(self, base_time_steps):
         """ overwrites set_time_steps_operation
@@ -72,6 +79,14 @@ class Carrier(Element):
         """ constructs the pe.Params of the class <Carrier>
 
         :param optimization_setup: The OptimizationSetup the element is part of """
+        # gamma max parameter
+        optimization_setup.parameters.add_parameter(name="gamma_max", index_names=["set_carriers", "set_nodes", "set_time_steps_operation"], doc='Parameter that says how much of the demand is flexible', calling_class=cls)
+        # size of the flexibility window
+        optimization_setup.parameters.add_parameter(name="flexibility_window_size", index_names=["set_carriers"], doc='Parameter which specifies across how many hours the demand response has to be balanced out', calling_class=cls)
+        # delayed shifting parameter
+        optimization_setup.parameters.add_parameter(name="delay", index_names=["set_carriers"], doc='Parameter that says how long the flexible windows are delayed', calling_class=cls)
+        # demand shifting price
+        optimization_setup.parameters.add_parameter(name="price_shifted_demand",index_names=["set_carriers"], doc='Parameter which specifies the price to shift demand', calling_class=cls)
         # demand of carrier
         optimization_setup.parameters.add_parameter(name="demand", index_names=["set_carriers", "set_nodes", "set_time_steps_operation"], doc='Parameter which specifies the carrier demand', calling_class=cls)
         # availability of carrier
@@ -104,6 +119,12 @@ class Carrier(Element):
         variables = optimization_setup.variables
         sets = optimization_setup.sets
 
+        # shift of flexible demand
+        variables.add_variable(model, name="shifted_demand", index_sets=cls.create_custom_set(["set_carriers", "set_nodes", "set_time_steps_operation"], optimization_setup),
+                               doc="how much flexible demand is shifted in or out", unit_category={"energy_quantity": 1, "time": -1})
+        variables.add_variable(model, name="shifted_out", index_sets=cls.create_custom_set(
+            ["set_carriers", "set_nodes", "set_time_steps_operation"], optimization_setup),
+                               doc="how much flexible demand is shifted out", unit_category={"energy_quantity": 1, "time": -1})
         # flow of imported carrier
         variables.add_variable(model, name="flow_import", index_sets=cls.create_custom_set(["set_carriers", "set_nodes", "set_time_steps_operation"], optimization_setup), bounds=(0,np.inf),
                                doc="node- and time-dependent carrier import from the grid", unit_category={"energy_quantity": 1, "time": -1})
@@ -129,6 +150,10 @@ class Carrier(Element):
         variables.add_variable(model, name="cost_shed_demand", index_sets=cls.create_custom_set(["set_carriers", "set_nodes", "set_time_steps_operation"], optimization_setup), bounds=(0,np.inf),
                                doc="shed demand of carrier", unit_category={"money": 1, "time": -1})
 
+        # cost of shed demand
+        variables.add_variable(model, name="cost_shifted_demand", index_sets=cls.create_custom_set(["set_carriers", "set_nodes", "set_time_steps_operation"], optimization_setup), bounds=(0, np.inf),
+                               doc="shifted demand of carrier", unit_category={"money": 1, "time": -1})
+
         # add pe.Sets of the child classes
         for subclass in cls.__subclasses__():
             if np.size(optimization_setup.system[subclass.label]):
@@ -141,6 +166,15 @@ class Carrier(Element):
         :param optimization_setup: The OptimizationSetup the element is part of """
         rules = CarrierRules(optimization_setup)
 
+        # limit inshift/outshift of demand by gamma max and demand
+        rules.constraint_max_shifting()
+
+        #limits the range in which the demand can be shifted
+        rules.constraint_flexibility_window()
+
+        #limit shifted demand to the shifting out to use for cost
+        rules.constraint_shift_out_for_cost()
+
         # limit import/export flow by availability
         rules.constraint_availability_import_export()
 
@@ -152,6 +186,9 @@ class Carrier(Element):
 
         # cost and limit for shed demand
         rules.constraint_cost_limit_shed_demand()
+
+        # cost and limit for shifted demand
+        rules.constraint_cost_limit_shifted_demand()
 
         # total cost for carriers
         rules.constraint_cost_carrier_total()
@@ -191,6 +228,82 @@ class CarrierRules(GenericRule):
     # Rule-based constraints
     # ----------------------
 
+    def constraint_max_shifting(self):
+        """
+        ..
+        """
+
+        lhs_upper = self.variables["shifted_demand"] - self.parameters.gamma_max * self.parameters.demand
+        rhs_upper = 0
+        constraints_upper = lhs_upper <= rhs_upper
+
+        lhs_lower = - self.variables["shifted_demand"] - self.parameters.gamma_max * self.parameters.demand
+        rhs_lower = 0
+        constraints_lower = lhs_lower <= rhs_lower
+
+        self.constraints.add_constraint("constraint_max_shifting_upper", constraints_upper)
+        self.constraints.add_constraint("constraint_max_shifting_lower", constraints_lower)
+
+    def constraint_flexibility_window(self):
+        index_values, index_names = Carrier.create_custom_set(
+            ["set_carriers", "set_nodes", "set_time_steps_operation"],
+            self.optimization_setup
+        )
+        index = ZenIndex(index_values, index_names)
+
+        for carrier in index.get_unique([0]):
+
+            sd = self.variables["shifted_demand"]
+            time_dim = "set_time_steps_operation"
+            time_coord = index.get_unique(["set_time_steps_operation"])
+            ts = len(time_coord)
+
+
+            window_size = int(np.asarray(self.parameters.flexibility_window_size.loc[carrier]).item())
+            delayed_amount = int(np.asarray(self.parameters.delay.loc[carrier]).item())
+
+            if window_size == 0:
+                continue
+
+            window_number = ts // window_size
+            if ts % window_size != 0:
+                raise ValueError(f"ts={ts} must be divisible by window_size={window_size} for carrier={carrier}")
+
+            A = np.kron(np.eye(window_number, dtype=int), np.ones(window_size, dtype=int))
+            A_delayed = np.roll(A, shift=delayed_amount, axis=1)
+            window_matrix = xr.DataArray(
+                A_delayed,
+                coords={"window": np.arange(window_number), time_dim: time_coord},
+                dims=("window", time_dim),
+                name="window_matrix"
+            )
+
+            sd_c = sd.sel(set_carriers = carrier)
+            lhs = (sd_c * window_matrix).sum(dim=time_dim)
+
+            constraints = lhs == 0
+            self.constraints.add_constraint(
+                    f"constraint_flexibility_window_{carrier}",
+                    constraints
+            )
+
+    def constraint_shift_out_for_cost(self):
+
+        lhs_lower = -self.variables["shifted_demand"] - self.variables["shifted_out"]
+        rhs_lower = 0
+
+        constraints_lower = lhs_lower <= rhs_lower
+
+        lhs_nonzero = - self.variables["shifted_out"]
+        rhs_nonzero = 0
+
+        constraints_nonzero = lhs_nonzero <= rhs_nonzero
+
+        self.constraints.add_constraint("constraint_shift_out_lower", constraints_lower)
+        self.constraints.add_constraint("constraint_shift_out_nonzero", constraints_nonzero)
+
+
+
     def constraint_cost_carrier_total(self):
         """ total cost of importing and exporting carrier
 
@@ -205,7 +318,7 @@ class CarrierRules(GenericRule):
         """
         times = self.get_year_time_step_duration_array()
         term_summed_cost_carrier = (
-                    (self.variables["cost_carrier"].broadcast_like(times) + self.variables["cost_shed_demand"].broadcast_like(times))
+                    (self.variables["cost_carrier"].broadcast_like(times) + self.variables["cost_shed_demand"].broadcast_like(times) + self.variables["cost_shifted_demand"].broadcast_like(times))
                     * times).sum(["set_carriers", "set_nodes", "set_time_steps_operation"])
         lhs = self.variables["cost_carrier_total"] - term_summed_cost_carrier
         rhs = 0
@@ -345,6 +458,44 @@ class CarrierRules(GenericRule):
 
         self.constraints.add_constraint("constraint_cost_shed_demand",constraints_cost)
         self.constraints.add_constraint("constraint_limit_shed_demand",constraints_shed_demand)
+
+    def constraint_cost_limit_shifted_demand(self):
+        """ cost and limit of shifting demand of carrier
+
+        .. math::
+           O_{c,n,t}^{\\mathrm{shifted}\\ \\mathrm{demand}} = D_{c,n,t} \\nu_c \n
+           D_{c,n,t} \\leq d_{c,n,t}
+
+        :math:`O_{c,n,t}^{\\mathrm{shifted}\\ \\mathrm{demand}}`: total cost of shedding demand of carrier :math:`c` at node :math:`n` and time step :math:`t`\n
+        :math:`\\nu_c`: price to shed demand of carrier :math:`c`\n
+        :math:`D_{c,n,t}`: shed demand of carrier :math:`c` at node :math:`n` and time step :math:`t`\n
+        :math:`d_{c,n,t}`: demand of carrier :math:`c` at node :math:`n` and time step :math:`t`
+
+
+        """
+
+        ### mask for finite price, otherwise the shifted demand is zero
+
+        """mask = self.parameters.price_shifted_demand != np.inf
+
+        # cost of shifting demand
+        lhs_cost = (self.variables["cost_shifted_demand"] - self.parameters.price_shifted_demand * self.variables["shifted_demand"]).where(mask)
+        rhs_cost = 0
+        constraints_cost = lhs_cost == rhs_cost
+
+        # limit of shifting demand, either the demand (price != inf) or zero (price == inf)
+        lhs_shifted_demand = self.variables["shifted_demand"]
+        rhs_shifted_demand = self.parameters.demand.where(mask, 0.0)
+        constraints_shifted_demand = lhs_shifted_demand <= rhs_shifted_demand
+
+        self.constraints.add_constraint("constraint_cost_shifted_demand",constraints_cost)
+        self.constraints.add_constraint("constraint_limit_shifted_demand",constraints_shifted_demand)
+        """
+        mask = self.parameters.price_shifted_demand != np.inf
+        price = self.parameters.price_shifted_demand.where(mask, 0.0)
+
+        constraints_cost = self.variables["cost_shifted_demand"] == price * self.variables["shifted_out"]
+        self.constraints.add_constraint("constraint_cost_shifted_demand",constraints_cost)
 
     def constraint_carbon_emissions_carrier(self):
         """ carbon emissions of importing and exporting carrier
@@ -525,7 +676,8 @@ class CarrierRules(GenericRule):
         term_carrier_demand = self.parameters.demand
         # shed demand
         term_carrier_shed_demand = self.variables["shed_demand"].to_linexpr()
-
+        # shifted demand
+        term_carrier_shifted_demand = self.variables["shifted_demand"].to_linexpr()
         ### formulate the constraints
         lhs = lp.merge([term_carrier_conversion_out,
                        -term_carrier_conversion_in,
@@ -535,7 +687,9 @@ class CarrierRules(GenericRule):
                        term_flow_storage_discharge,
                        term_carrier_import,
                        -term_carrier_export,
-                       term_carrier_shed_demand],
+                       term_carrier_shed_demand,
+                       term_carrier_shifted_demand
+                        ],
                        compat="broadcast_equals", join="outer", cls=LinearExpression)
         rhs = term_carrier_demand
         aligned_idx = xr.align(lhs.coords,rhs,join="inner")[0]

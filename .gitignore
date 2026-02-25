@@ -8,6 +8,7 @@
 !/data/.gitkeep
 outputs*/
 zen_garden_env/
+Output Analysis/
 *.swp
 *~
 *.pyc
